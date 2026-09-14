@@ -1,0 +1,6 @@
+/.gigacode/
+/.gigaide/
+/logs/
+/*.exe
+/.idea/
+/*.patch
