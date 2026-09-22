@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 )
 
 // PointsChecker интерфейс для проверки заказов во внешней системе расчёта баллов.
@@ -171,77 +172,85 @@ func (s *OrderService) SubmitOrders(ctx context.Context, userID string, numbers 
 	}
 	s.mu.Unlock()
 
+	// Запускаем проверку заказов во внешней системе параллельно без блокировки HTTP-ответа.
+	// Каждая горутина получает автономный контекст от context.Background(),
+	// поэтому обработка продолжается даже после того, как ответ ушёл клиенту.
+	var g errgroup.Group
+	g.SetLimit(10)
 	for _, number := range accepted {
-		s.processOrderAsync(ctx, userID, number)
+		number := number
+		userID := userID
+		g.Go(func() error {
+			workCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			s.processOrder(workCtx, userID, number)
+			return nil
+		})
 	}
+	// Не вызываем g.Wait() — обработка идёт в фоне, ответ 202 улетает сразу.
 
 	return accepted, duplicates, conflicts, nil
 }
 
-func (s *OrderService) processOrderAsync(ctx context.Context, userID, orderNumber string) {
-	go func() {
-		workCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
+// processOrder проверяет заказ во внешней системе и обновляет его статус.
+// Вызывается из горутин, запущенных в SubmitOrders.
+func (s *OrderService) processOrder(ctx context.Context, userID, orderNumber string) {
+	points, err := s.points.CheckOrder(ctx, orderNumber)
+	if err != nil {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"user_id": userID,
+			"order":   orderNumber,
+		}).Warn("external check failed for order")
+		return
+	}
 
-		points, err := s.points.CheckOrder(workCtx, orderNumber)
+	status := "PROCESSED"
+	if points == 0 {
+		status = "INVALID"
+	}
+
+	accrual := points
+	if status == "INVALID" {
+		accrual = 0
+	}
+
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE orders SET status = $1, accrual = $2, updated_at = now()
+		 WHERE user_id = $3 AND order_number = $4`,
+		status, accrual, userID, orderNumber,
+	)
+	if err != nil {
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"user_id": userID,
+			"order":   orderNumber,
+		}).Error("failed to update order status")
+		return
+	}
+
+	if status == "PROCESSED" {
+		var orderID string
+		err = s.db.QueryRowContext(ctx, "SELECT id FROM orders WHERE user_id = $1 AND order_number = $2", userID, orderNumber).Scan(&orderID)
 		if err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{
 				"user_id": userID,
 				"order":   orderNumber,
-			}).Warn("external check failed for order")
-			// При ошибке оставляем статус NEW (внешняя система недоступна)
-			// Возвращаем 502 Bad Gateway
+			}).Error("failed to get order ID for transaction")
 			return
 		}
 
-		status := "PROCESSED"
-		if points == 0 {
-			status = "INVALID"
-		}
-
-		accrual := points
-		if status == "INVALID" {
-			accrual = 0
-		}
-
-		_, err = s.db.ExecContext(workCtx,
-			`UPDATE orders SET status = $1, accrual = $2, updated_at = now()
-			 WHERE user_id = $3 AND order_number = $4`,
-			status, accrual, userID, orderNumber,
+		desc := fmt.Sprintf("Баллы за заказ %s", orderNumber)
+		_, err = s.db.ExecContext(ctx,
+			`INSERT INTO transactions (user_id, order_id, type, points, description)
+			 VALUES ($1, $2, 'earned', $3, $4)`,
+			userID, orderID, points, desc,
 		)
 		if err != nil {
 			logrus.WithError(err).WithFields(logrus.Fields{
 				"user_id": userID,
 				"order":   orderNumber,
-			}).Error("failed to update order status")
-			return
+			}).Error("failed to insert earned transaction")
 		}
-
-		if status == "PROCESSED" {
-			var orderID string
-			err = s.db.QueryRowContext(workCtx, "SELECT id FROM orders WHERE user_id = $1 AND order_number = $2", userID, orderNumber).Scan(&orderID)
-			if err != nil {
-				logrus.WithError(err).WithFields(logrus.Fields{
-					"user_id": userID,
-					"order":   orderNumber,
-				}).Error("failed to get order ID for transaction")
-				return
-			}
-
-			desc := fmt.Sprintf("Баллы за заказ %s", orderNumber)
-			_, err = s.db.ExecContext(workCtx,
-				`INSERT INTO transactions (user_id, order_id, type, points, description)
-				 VALUES ($1, $2, 'earned', $3, $4)`,
-				userID, orderID, points, desc,
-			)
-			if err != nil {
-				logrus.WithError(err).WithFields(logrus.Fields{
-					"user_id": userID,
-					"order":   orderNumber,
-				}).Error("failed to insert earned transaction")
-			}
-		}
-	}()
+	}
 }
 
 // GetOrderCalculation получает статус расчёта заказа по номеру.

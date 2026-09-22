@@ -163,6 +163,11 @@ func TestBalanceHandler_Withdraw_Success(t *testing.T) {
 	// Transaction begin
 	mock.ExpectBegin()
 
+	// Lock transactions rows to prevent race condition on balance read
+	mock.ExpectExec("SELECT.*FOR UPDATE").
+		WithArgs("user-123").
+		WillReturnResult(sqlmock.NewResult(0, 0))
+
 	// Balance check inside transaction
 	mock.ExpectQuery("SELECT COALESCE").
 		WithArgs("user-123").
@@ -229,6 +234,11 @@ func TestBalanceHandler_Withdraw_Insufficient(t *testing.T) {
 
 	// Transaction begin
 	mock.ExpectBegin()
+
+	// Lock transactions rows to prevent race condition on balance read
+	mock.ExpectExec("SELECT.*FOR UPDATE").
+		WithArgs("user-123").
+		WillReturnResult(sqlmock.NewResult(0, 0))
 
 	// Balance check - returns 50, not enough for sum 100
 	mock.ExpectQuery("SELECT COALESCE").

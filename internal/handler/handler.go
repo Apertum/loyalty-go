@@ -437,8 +437,24 @@ func (h *BalanceHandler) Withdraw(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Блокируем строки транзакций для предотвращения race condition
-	// READ UNCOMMITTED для чтения баланса с FOR UPDATE
+	// SELECT FOR UPDATE с агрегатами COUNT/SUM в PostgreSQL не работает — он блокирует
+	// только одну произвольную строку результата агрегата, а не исходные строки.
+	// Поэтому сначала выполняем отдельный запрос, который «захватывает» все строки
+	// транзакций пользователя. Этот запрос возвращает 0 строк (только row count),
+	// но PostgreSQL помещает во внутреннюю очередь ожидания ALL строки таблицы
+	// transactions, отфильтрованные по user_id, помеченные как FOR UPDATE.
+	// Второй параллельный Withdraw на этой же строке заблокируется и ждёт завершения
+	// первой транзакции — после rollback/commit он видит уже обновлённый баланс,
+	// а не устаревший, что предотвращает уход счёта в минус.
+	_, err = tx.ExecContext(r.Context(),
+		"SELECT id FROM transactions WHERE user_id = $1 ORDER BY id FOR UPDATE",
+		userID,
+	)
+	if err != nil {
+		appMw.WriteError(w, http.StatusInternalServerError, appMw.ServerError, "failed to lock transactions")
+		return
+	}
+
 	var currentBalance sql.NullFloat64
 	err = tx.QueryRowContext(r.Context(), `
 		SELECT COALESCE(SUM(CASE WHEN t.points > 0 THEN t.points ELSE 0 END), 0)::float -

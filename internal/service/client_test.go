@@ -91,29 +91,23 @@ func TestCheckOrder_AllRetriesFail(t *testing.T) {
 	}
 }
 
-func TestProcessOrderAsync_Runs(t *testing.T) {
+func TestProcessOrder_FailsGracefully(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("failed to create mock db: %v", err)
 	}
 	defer db.Close()
 
-	// processOrderAsync теперь не ставит PROCESSING, сразу вызывает CheckOrder
-	// Mock для успешного CheckOrder (возвращает ошибку т.к. сервер недоступен)
-	client := NewPointsCalcClient("http://localhost:1") // недостижимый сервер
+	// processOrder теперь синхронный — вызывается из errgroup.Go.
+	// CheckOrder упадёт на unreachable сервере, но processOrder должен обработать это без panic.
+	client := NewPointsCalcClient("http://localhost:1")
 	svc := NewOrderService(db, client)
 
-	done := make(chan struct{})
-	go func() {
-		svc.processOrderAsync(context.Background(), "user-123", "123456")
-		close(done)
-	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 
-	select {
-	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("processOrderAsync timed out")
-	}
+	svc.processOrder(ctx, "user-123", "123456")
+	// Если дошли сюда — panic не произошло, тест прошёл.
 }
 
 func TestIsDuplicateError_Nil(t *testing.T) {
